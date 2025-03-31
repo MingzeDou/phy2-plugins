@@ -30,51 +30,60 @@ class ReclusterUMAP(IPlugin):
 
         def compute_template_correlation(features, labels):
             """Compute correlation between cluster templates"""
-            n_clusters = len(np.unique(labels[labels > 0]))
+            unique_labels = np.unique(labels[labels > 0])
+            n_clusters = len(unique_labels)
             correlations = np.zeros((n_clusters, n_clusters))
+            
+            # Cache templates for efficiency
+            templates = {}
+            for i, label in enumerate(unique_labels):
+                templates[i] = np.mean(features[labels == label], axis=0)
 
             for i in range(n_clusters):
-                template_i = np.mean(features[labels == i + 1], axis=0)
                 for j in range(i + 1, n_clusters):
-                    template_j = np.mean(features[labels == j + 1], axis=0)
+                    # Use cached templates
+                    template_i = templates[i]
+                    template_j = templates[j]
                     # Correlation between templates
                     corr = np.corrcoef(template_i, template_j)[0, 1]
                     correlations[i, j] = correlations[j, i] = corr
 
-            return correlations
+            return correlations, unique_labels
 
-        def check_spatial_consistency(features, labels, threshold=0.6):
-            """Check if clusters are spatially consistent"""
-            n_clusters = len(np.unique(labels[labels > 0]))
+        def check_spatial_consistency(original_features, labels, threshold=0.6):
+            """Check if clusters are spatially consistent using original features"""
+            unique_labels = np.unique(labels[labels > 0])
+            n_clusters = len(unique_labels)
             spatial_consistent = np.zeros((n_clusters, n_clusters), dtype=bool)
 
-            # Assuming features contain channel information
+            # Cache channel variance for each cluster
+            cluster_channels = {}
+            for i, label in enumerate(unique_labels):
+                spikes_i = original_features[labels == label]
+                cluster_channels[i] = np.var(spikes_i, axis=0).argsort()[-4:]  # Top 4 channels
+
             for i in range(n_clusters):
-                spikes_i = features[labels == i + 1]
-                channels_i = np.var(spikes_i, axis=0).argsort()[-4:]  # Top 4 channels
-
                 for j in range(i + 1, n_clusters):
-                    spikes_j = features[labels == j + 1]
-                    channels_j = np.var(spikes_j, axis=0).argsort()[-4:]
-
                     # Check channel overlap
-                    common_channels = len(set(channels_i) & set(channels_j))
+                    common_channels = len(set(cluster_channels[i]) & set(cluster_channels[j]))
+                    threshold_channels = len(cluster_channels[i]) * threshold
                     spatial_consistent[i, j] = spatial_consistent[j, i] = (
-                            common_channels >= len(channels_i) * threshold
+                            common_channels >= threshold_channels
                     )
 
             return spatial_consistent
 
-        def merge_similar_clusters(features, labels, template_threshold=0.9, spatial_threshold=0.6):
+        def merge_similar_clusters(features, original_features, labels, template_threshold=0.9, spatial_threshold=0.6):
             """Merge clusters based on template similarity and spatial consistency"""
             while True:
-                n_clusters = len(np.unique(labels[labels > 0]))
+                unique_labels = np.unique(labels[labels > 0])
+                n_clusters = len(unique_labels)
                 if n_clusters <= 2:  # Don't merge if only 2 clusters remain
                     break
 
                 # Compute similarity matrices
-                correlations = compute_template_correlation(features, labels)
-                spatial_consistent = check_spatial_consistency(features, labels, spatial_threshold)
+                correlations, label_indices = compute_template_correlation(features, labels)
+                spatial_consistent = check_spatial_consistency(original_features, labels, spatial_threshold)
 
                 # Find most similar pair that's spatially consistent
                 max_corr = template_threshold
@@ -89,40 +98,47 @@ class ReclusterUMAP(IPlugin):
                 if merge_pair is None:
                     break
 
-                # Perform merge
+                # Perform merge - create a label mapping for continuous labeling
                 i, j = merge_pair
-                new_labels = np.zeros_like(labels)
-                for k in range(n_clusters):
-                    if k == i:
-                        new_labels[labels == k + 1] = i + 1
-                    elif k == j:
-                        new_labels[labels == j + 1] = i + 1
-                    elif k > j:
-                        new_labels[labels == k + 1] = k
-                    else:
-                        new_labels[labels == k + 1] = k + 1
-
-                labels = new_labels
-                logger.info(f"Merged clusters {i + 1} and {j + 1} (correlation: {max_corr:.3f})")
+                label_i = label_indices[i]
+                label_j = label_indices[j]
+                
+                # Create new labels by merging j into i
+                new_labels = labels.copy()
+                new_labels[labels == label_j] = label_i
+                
+                # Relabel to ensure continuous numbering
+                unique_new_labels = np.unique(new_labels[new_labels > 0])
+                label_map = {old: new+1 for new, old in enumerate(unique_new_labels)}
+                
+                result_labels = np.zeros_like(labels)
+                for old_label, new_label in label_map.items():
+                    result_labels[new_labels == old_label] = new_label
+                
+                labels = result_labels
+                logger.info(f"Merged clusters (correlation: {max_corr:.3f})")
 
             return labels
 
-        def fastClustering(embedding, target_clusters=4):
+        def fastClustering(embedding, original_features, target_clusters=4):
             """Fast clustering with intelligent merging"""
             # Initial over-clustering
             initial_clusters = min(target_clusters * 3, len(embedding) // 50)
+            initial_clusters = max(initial_clusters, target_clusters)  # Ensure we have at least the target number
 
-            # Initial clustering
-            kmeans = MiniBatchKMeans(
-                n_clusters=initial_clusters,
-                batch_size=1000,
-                random_state=42
+            # Use GMM for clustering to match function name
+            gmm = GaussianMixture(
+                n_components=initial_clusters,
+                covariance_type='full',
+                random_state=42,
+                max_iter=100
             )
-            initial_labels = kmeans.fit_predict(embedding) + 1  # Make labels 1-based
+            initial_labels = gmm.fit_predict(embedding) + 1  # Make labels 1-based
 
             # Merge similar clusters
             final_labels = merge_similar_clusters(
                 embedding,
+                original_features,  # Pass original features for spatial consistency check
                 initial_labels,
                 template_threshold=0.9,
                 spatial_threshold=0.6
@@ -153,10 +169,17 @@ class ReclusterUMAP(IPlugin):
                     bunchs = controller._amplitude_getter(clusterIds, name='template', load_all=True)
                     spikeIds = bunchs[0].spike_ids
                     n_spikes = len(spikeIds)
+                    
+                    if n_spikes < target_clusters * 5:
+                        logger.warn(f"Too few spikes ({n_spikes}) for {target_clusters} clusters")
+                        return
+                        
                     logger.info(f"Processing {n_spikes} spikes with target {target_clusters} clusters")
 
                     # Feature preparation
                     features = prepareFeatures(spikeIds)
+                    original_features = features.copy()  # Keep original features for spatial consistency
+                    
                     scaler = StandardScaler()
                     featuresScaled = scaler.fit_transform(features)
 
@@ -164,12 +187,13 @@ class ReclusterUMAP(IPlugin):
                     pca = PCA(n_components=min(30, featuresScaled.shape[1]))
                     featuresPca = pca.fit_transform(featuresScaled)
 
-                    # UMAP reduction
+                    # UMAP reduction with more robust n_neighbors setting
                     if (self._umap_reducer is None or
                             self._last_n_spikes is None or
                             abs(self._last_n_spikes - n_spikes) > n_spikes * 0.2):
+                        n_neighbors = max(15, min(50, n_spikes // 100))
                         self._umap_reducer = umap.UMAP(
-                            n_neighbors=min(30, n_spikes // 100),
+                            n_neighbors=n_neighbors,
                             min_dist=0.2,
                             n_components=2,
                             random_state=42,
@@ -181,8 +205,8 @@ class ReclusterUMAP(IPlugin):
 
                     embedding = self._umap_reducer.fit_transform(featuresPca)
 
-                    # Clustering with merging
-                    labels = fastClustering(embedding, target_clusters)
+                    # Clustering with merging, passing original_features for spatial consistency
+                    labels = fastClustering(embedding, original_features, target_clusters)
                     n_clusters = len(np.unique(labels))
 
                     logger.info(f"Created {n_clusters} clusters after merging")

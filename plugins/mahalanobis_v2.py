@@ -2,13 +2,16 @@ from phy import IPlugin, connect
 import logging
 import numpy as np
 from scipy.stats import chi2
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import warnings
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from qtpy import QtWidgets, QtCore
 import seaborn as sns
+from threading import Thread
+import time
+from functools import partial
 
 logger = logging.getLogger('phy')
 
@@ -23,8 +26,68 @@ class StableMahalanobisDetection(IPlugin):
         self._spike_ids = None
         self._n_features = None
         self._feature_structure = None
+        self.progress_dialog = None
+        self.use_robust_scaling = False
+        self._pending_distances = None
+        self._pending_threshold = None
+        self._suggest_thresholds = None
+        self._perform_outlier_detection = None
+        
+        # Create timer for cross-thread communication
+        self._timer = QtCore.QTimer()
+        self._timer.timeout.connect(self._check_pending_actions)
+        self._timer.start(100)  # Check every 100ms
+        
+        # Queue for actions to perform on the main thread
+        self._pending_actions = []
+
+    def _check_pending_actions(self):
+        """Check for pending actions to execute on the main thread"""
+        if self._pending_actions:
+            action = self._pending_actions.pop(0)
+            action()
+
+    def add_main_thread_action(self, action):
+        """Add an action to be performed on the main thread"""
+        self._pending_actions.append(action)
+
+    def show_progress_dialog(self, message):
+        """Show a progress dialog with the given message"""
+        if self.progress_dialog is None:
+            self.progress_dialog = QtWidgets.QProgressDialog(
+                message, "Cancel", 0, 0, None
+            )
+            self.progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
+            self.progress_dialog.setMinimumWidth(300)
+            self.progress_dialog.setCancelButton(None)
+            self.progress_dialog.setAutoClose(False)
+        else:
+            self.progress_dialog.setLabelText(message)
+        
+        self.progress_dialog.show()
+
+    def close_progress_dialog(self):
+        """Close the progress dialog if it exists"""
+        if self.progress_dialog and self.progress_dialog.isVisible():
+            self.progress_dialog.close()
+
+    def plot_distribution_from_thread(self):
+        """Method to be called via the timer to show plot from thread"""
+        if self._pending_distances is not None:
+            distances = self._pending_distances
+            threshold = self._pending_threshold
+            self._pending_distances = None
+            self._pending_threshold = None
+            self.plot_distribution(distances, threshold)
+
+    def show_error_dialog(self, message):
+        """Show error dialog with the given message"""
+        QtWidgets.QMessageBox.critical(None, 'Error', message)
 
     def attach_to_controller(self, controller):
+        # Save self reference for nested functions
+        plugin = self
+        
         def get_feature_dimensions(features_arr):
             """Analyze the feature array structure to get actual dimensions"""
             try:
@@ -51,6 +114,11 @@ class StableMahalanobisDetection(IPlugin):
                 # Log feature shape information
                 logger.info(f"Original feature shape: {features.shape}")
 
+                # Check for NaN values
+                if np.isnan(features).any():
+                    logger.warn(f"Warning: NaN values detected in features. Replacing with zeros.")
+                    features = np.nan_to_num(features, nan=0.0)
+
                 # Reshape maintaining actual structure
                 features_flat = np.reshape(features, (features.shape[0], -1))
 
@@ -71,27 +139,82 @@ class StableMahalanobisDetection(IPlugin):
                 return None
 
             try:
-                scaler = StandardScaler()
+                # Use robust scaling if option is enabled
+                if self.use_robust_scaling:
+                    scaler = RobustScaler()
+                    logger.info("Using robust scaling for feature normalization")
+                else:
+                    scaler = StandardScaler()
+                
                 X_scaled = scaler.fit_transform(X)
-                cov = np.cov(X_scaled, rowvar=False)
+                
+                # Handle large feature matrices with batch processing
+                if X.shape[0] > 10000:
+                    logger.info(f"Large dataset detected ({X.shape[0]} samples). Computing covariance efficiently...")
+                    # Computing covariance efficiently for large datasets
+                    cov_chunks = []
+                    chunk_size = 5000
+                    for i in range(0, X_scaled.shape[0], chunk_size):
+                        chunk = X_scaled[i:i+chunk_size]
+                        cov_chunks.append(np.cov(chunk, rowvar=False))
+                    cov = np.mean(cov_chunks, axis=0)
+                else:
+                    cov = np.cov(X_scaled, rowvar=False)
+                
                 n_features = cov.shape[0]
+                # Regularization to ensure positive definiteness
                 cov += np.eye(n_features) * 1e-6
 
                 try:
-                    U, s, Vt = np.linalg.svd(cov)
-                    s[s < 1e-8] = 1e-8
+                    # SVD approach for numerical stability
+                    U, s, Vt = np.linalg.svd(cov, full_matrices=False)
+                    
+                    # Filter out very small eigenvalues
+                    s_threshold = 1e-8 * np.max(s)
+                    s[s < s_threshold] = s_threshold
+                    
+                    # Compute precision matrix
                     inv_cov = (U / s) @ Vt
+                    
+                    # Compute distances
                     mu = np.mean(X_scaled, axis=0)
-                    diff = X_scaled - mu
-                    distances = np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
-                    return np.nan_to_num(distances, nan=np.inf)
+                    
+                    # Process in batches for large datasets
+                    if X.shape[0] > 50000:
+                        logger.info("Computing distances in batches...")
+                        distances = np.zeros(X_scaled.shape[0])
+                        batch_size = 10000
+                        for i in range(0, X_scaled.shape[0], batch_size):
+                            batch = X_scaled[i:i+batch_size]
+                            diff = batch - mu
+                            distances[i:i+batch_size] = np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
+                    else:
+                        diff = X_scaled - mu
+                        distances = np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
+                    
+                    # Handle any numerical issues
+                    return np.nan_to_num(distances, nan=np.inf, posinf=np.inf, neginf=np.inf)
 
                 except np.linalg.LinAlgError as e:
-                    logger.error(f"SVD failed: {str(e)}, falling back to diagonal covariance")
-                    inv_cov = np.diag(1.0 / np.diag(cov))
-                    mu = np.mean(X_scaled, axis=0)
-                    diff = X_scaled - mu
-                    return np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
+                    logger.error(f"SVD failed: {str(e)}, attempting more robust approach")
+                    
+                    # Try eigenvalue decomposition with more stability controls
+                    try:
+                        eigenvals, eigenvecs = np.linalg.eigh(cov)
+                        # Set small eigenvalues to a minimum value
+                        eigenvals[eigenvals < 1e-8] = 1e-8
+                        # Reconstruct precision matrix
+                        inv_cov = eigenvecs @ np.diag(1.0/eigenvals) @ eigenvecs.T
+                        mu = np.mean(X_scaled, axis=0)
+                        diff = X_scaled - mu
+                        return np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
+                    except Exception:
+                        # Last resort: use diagonal covariance
+                        logger.error("Eigendecomposition failed, using diagonal covariance")
+                        inv_cov = np.diag(1.0 / (np.diag(cov) + 1e-8))
+                        mu = np.mean(X_scaled, axis=0)
+                        diff = X_scaled - mu
+                        return np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
 
             except Exception as e:
                 logger.error(f"Error in Mahalanobis distance calculation: {str(e)}")
@@ -99,10 +222,10 @@ class StableMahalanobisDetection(IPlugin):
 
         def calculate_robust_threshold(distances):
             """Calculate default threshold based on chi-square distribution"""
-            if distances is None or len(distances) == 0 or self._n_features is None:
+            if distances is None or len(distances) == 0 or plugin._n_features is None:
                 return None
             # Use 99.99% chi-square threshold as default (very conservative)
-            return np.sqrt(chi2.ppf(0.9999, self._n_features))
+            return np.sqrt(chi2.ppf(0.9999, plugin._n_features))
 
         def suggest_thresholds(distances):
             """Suggest thresholds with focus on empirical distribution"""
@@ -118,8 +241,8 @@ class StableMahalanobisDetection(IPlugin):
                 }
 
                 # Add chi-square thresholds if dimensionality is available
-                if self._n_features is not None:
-                    p = self._n_features
+                if plugin._n_features is not None:
+                    p = plugin._n_features
                     chi2_thresh_999 = np.sqrt(chi2.ppf(0.999, p))  # More conservative (0.1% false positive rate)
                     chi2_thresh_9999 = np.sqrt(chi2.ppf(0.9999, p))  # Very conservative (0.01% false positive rate)
                     empirical_thresholds['χ²_999'] = chi2_thresh_999
@@ -130,20 +253,60 @@ class StableMahalanobisDetection(IPlugin):
             except Exception as e:
                 logger.error(f"Error calculating threshold suggestions: {str(e)}")
                 return {}
+        
+        # Store function reference to access from methods
+        self._suggest_thresholds = suggest_thresholds
 
+        def perform_outlier_detection(threshold, distances):
+            """Perform outlier detection with given threshold"""
+            if distances is None or plugin._spike_ids is None:
+                logger.warn("No distances or spike IDs available")
+                return
+
+            try:
+                outliers = distances > threshold
+                n_outliers = np.sum(outliers)
+
+                # Log results
+                logger.info(f"Analysis with threshold {threshold}:")
+                logger.info(f"- Detected {n_outliers} outliers ({n_outliers / len(distances) * 100:.1f}%)")
+                logger.info(f"- Maximum distance: {np.max(distances):.1f}")
+                logger.info(f"- 99.9th percentile: {np.percentile(distances, 99.9):.1f}")
+                logger.info(f"- 99th percentile: {np.percentile(distances, 99):.1f}")
+                logger.info(f"- Median distance: {np.median(distances):.1f}")
+
+                # Sort and display top distances
+                sorted_dist = np.sort(distances)[-10:]
+                logger.info(f"Top 10 distances: {', '.join(f'{d:.1f}' for d in sorted_dist)}")
+
+                # Prepare for split
+                if n_outliers > 0:
+                    labels = np.ones(len(distances), dtype=int)
+                    labels[outliers] = 2
+                    controller.supervisor.actions.split(plugin._spike_ids, labels)
+                else:
+                    logger.info("No outliers detected at current threshold")
+
+            except Exception as e:
+                logger.error(f"Error in outlier detection: {str(e)}")
+                
+        # Store function reference to access from methods
+        self._perform_outlier_detection = perform_outlier_detection
+        
+        # Override the plot_distribution method 
         def plot_distribution(distances, threshold=None):
             """Create distribution plot with optional theoretical comparison"""
             if distances is None or len(distances) == 0:
                 logger.error("No valid distances to plot")
                 return
 
-            if self.plot_window is None:
-                self.plot_window = QtWidgets.QMainWindow()
-                self.plot_window.setWindowTitle('Mahalanobis Distance Distribution')
+            if plugin.plot_window is None:
+                plugin.plot_window = QtWidgets.QMainWindow()
+            plugin.plot_window.setWindowTitle('Mahalanobis Distance Distribution')
 
             # Create widgets and layout
             widget = QtWidgets.QWidget()
-            self.plot_window.setCentralWidget(widget)
+            plugin.plot_window.setCentralWidget(widget)
             layout = QtWidgets.QVBoxLayout(widget)
 
             # Create figure
@@ -152,31 +315,45 @@ class StableMahalanobisDetection(IPlugin):
             ax = fig.add_subplot(111)
             fig.subplots_adjust(right=0.85, bottom=0.15)
 
-            # Plot range
+            # Plot range - improved to handle extreme outliers better
             max_dist = np.max(distances)
             q99_9 = np.percentile(distances, 99.9)
-            plot_max = min(max_dist, q99_9 * 1.2)
+            q95 = np.percentile(distances, 95)
+            # Adaptive plot range based on distribution
+            if max_dist > q99_9 * 2:
+                plot_max = min(q99_9 * 1.5, q95 * 3)  # Handle extreme outliers better
+                logger.info(f"Limiting plot range to {plot_max:.1f} to exclude extreme outliers")
+            else:
+                plot_max = min(max_dist, q99_9 * 1.2)
 
             # Plot empirical distribution
-            n_bins = min(100, int(np.sqrt(len(distances))))
+            n_bins = min(100, max(30, int(np.sqrt(len(distances)))))
             sns.histplot(distances, ax=ax, bins=n_bins, stat='density')
             ax.set_xlim(0, plot_max)
 
             # Add theoretical comparison if dimensions are known
-            if self._n_features is not None:
+            if plugin._n_features is not None:
                 x = np.linspace(0, plot_max, 200)
-                chi_density = 2 * x * chi2.pdf(x ** 2, self._n_features)
-                ax.plot(x, chi_density, 'r--', alpha=0.3,
-                        label=f'χ² ({self._n_features} df)')
+                chi_density = 2 * x * chi2.pdf(x ** 2, plugin._n_features)
+                ax.plot(x, chi_density, 'r--', alpha=0.5,
+                        label=f'χ² ({plugin._n_features} df)')
+                
+                # Display goodness-of-fit statistics
+                ks_stat = np.max(np.abs(np.cumsum(np.histogram(distances, bins=100)[0]) / 
+                                        len(distances) - 
+                                        chi2.cdf(np.histogram(distances, bins=100)[1][1:]**2, plugin._n_features)))
+                ax.text(0.02, 0.98, f'KS distance: {ks_stat:.3f}', 
+                        transform=ax.transAxes, va='top', fontsize=9)
 
             # Labels and formatting
             ax.set_xlabel('Mahalanobis Distance', fontsize=10)
             ax.set_ylabel('Density', fontsize=10)
             ax.tick_params(labelsize=9)
+            ax.set_title(f'Distribution of Mahalanobis Distances (n={len(distances)})', fontsize=11)
 
-            # Plot thresholds
-            suggestions = suggest_thresholds(distances)
-            colors = ['r', 'g', 'b', 'purple']
+            # Plot thresholds using stored suggest_thresholds function
+            suggestions = plugin._suggest_thresholds(distances)
+            colors = ['r', 'g', 'b', 'purple', 'orange']
             for (name, value), color in zip(suggestions.items(), colors):
                 if value <= plot_max:
                     n_spikes = np.sum(distances > value)
@@ -203,6 +380,17 @@ class StableMahalanobisDetection(IPlugin):
             threshold_input.returnPressed.connect(on_return_pressed)
 
             form_layout.addRow("Threshold:", threshold_input)
+            
+            # Add robust scaling checkbox
+            robust_scaling_cb = QtWidgets.QCheckBox("Use robust scaling")
+            robust_scaling_cb.setChecked(plugin.use_robust_scaling)
+            robust_scaling_cb.setToolTip("Use median instead of mean for centering (more robust to outliers)")
+            
+            def on_robust_changed(state):
+                plugin.use_robust_scaling = state == QtCore.Qt.Checked
+            
+            robust_scaling_cb.stateChanged.connect(on_robust_changed)
+            form_layout.addRow("", robust_scaling_cb)
 
             # Button layout
             button_layout = QtWidgets.QHBoxLayout()
@@ -220,47 +408,80 @@ class StableMahalanobisDetection(IPlugin):
             apply_button = QtWidgets.QPushButton('Apply Threshold')
             preview_button.setMinimumWidth(120)
             apply_button.setMinimumWidth(120)
+            
+            # Cancel button
+            cancel_button = QtWidgets.QPushButton('Cancel')
+            cancel_button.setMinimumWidth(120)
+            cancel_button.clicked.connect(plugin.plot_window.close)
 
             def on_preview():
                 try:
                     new_threshold = float(threshold_input.text())
                     n_outliers = np.sum(distances > new_threshold)
+                    
+                    # More detailed preview information
+                    message = (
+                        f'This threshold would mark {n_outliers} spikes ({n_outliers / len(distances) * 100:.2f}%) as outliers.\n\n'
+                        f'Distance statistics:\n'
+                        f'- Maximum distance: {np.max(distances):.1f}\n'
+                        f'- 99.9th percentile: {np.percentile(distances, 99.9):.1f}\n'
+                        f'- 99th percentile: {np.percentile(distances, 99):.1f}\n'
+                        f'- Median distance: {np.median(distances):.1f}\n\n'
+                        f'Theoretical χ² threshold (p=0.999): {np.sqrt(chi2.ppf(0.999, plugin._n_features)):.1f}'
+                    )
+                    
                     QtWidgets.QMessageBox.information(
-                        self.plot_window, 'Preview',
-                        f'This threshold would mark {n_outliers} spikes ({n_outliers / len(distances) * 100:.2f}%) as outliers.\n'
-                        f'Maximum distance: {np.max(distances):.1f}\n'
-                        f'99.9th percentile: {np.percentile(distances, 99.9):.1f}\n'
-                        f'99th percentile: {np.percentile(distances, 99):.1f}'
+                        plugin.plot_window, 'Preview', message
                     )
                 except ValueError:
-                    logger.error("Invalid threshold value")
+                    QtWidgets.QMessageBox.warning(
+                        plugin.plot_window, 'Error', "Invalid threshold value. Please enter a positive number."
+                    )
 
             def on_apply():
                 try:
                     new_threshold = float(threshold_input.text())
                     if not new_threshold > 0:
-                        logger.error("Threshold must be positive")
+                        QtWidgets.QMessageBox.warning(
+                            plugin.plot_window, 'Error', "Threshold must be positive"
+                        )
                         return
 
-                    self.current_threshold = new_threshold
+                    plugin.current_threshold = new_threshold
                     n_outliers = np.sum(distances > new_threshold)
 
+                    # Warning for very large outlier count
                     if n_outliers > len(distances) * 0.1:
                         reply = QtWidgets.QMessageBox.question(
-                            self.plot_window, 'Warning',
+                            plugin.plot_window, 'Warning',
                             f'This threshold would mark {n_outliers} spikes ({n_outliers / len(distances) * 100:.1f}%) as outliers. Continue?',
                             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
                         )
                         if reply == QtWidgets.QMessageBox.No:
                             return
 
-                    perform_outlier_detection(new_threshold, self.current_distances)
-                    self.plot_window.close()
+                    # Show progress during outlier detection
+                    plugin.show_progress_dialog("Detecting outliers...")
+                    
+                    # Run in a separate thread to avoid UI freezing
+                    def background_task():
+                        # Use stored function reference
+                        plugin._perform_outlier_detection(new_threshold, plugin.current_distances)
+                        
+                        # Close dialogs on the main thread
+                        plugin.add_main_thread_action(plugin.close_progress_dialog)
+                        plugin.add_main_thread_action(plugin.plot_window.close)
+                    
+                    Thread(target=background_task).start()
 
                 except ValueError:
-                    logger.error("Invalid threshold value")
+                    QtWidgets.QMessageBox.warning(
+                        plugin.plot_window, 'Error', "Invalid threshold value. Please enter a positive number."
+                    )
                 except Exception as e:
-                    logger.error(f"Error applying threshold: {str(e)}")
+                    QtWidgets.QMessageBox.critical(
+                        plugin.plot_window, 'Error', f"Error applying threshold: {str(e)}"
+                    )
 
             preview_button.clicked.connect(on_preview)
             apply_button.clicked.connect(on_apply)
@@ -271,12 +492,13 @@ class StableMahalanobisDetection(IPlugin):
             layout.addLayout(button_layout)
             layout.addSpacing(10)
             button_row = QtWidgets.QHBoxLayout()
+            button_row.addWidget(cancel_button)
             button_row.addWidget(preview_button)
             button_row.addWidget(apply_button)
             layout.addLayout(button_row)
 
             # Set window size and prepare to show
-            self.plot_window.resize(1600, 900)
+            plugin.plot_window.resize(1600, 900)
 
             # Create timer to select text after window is shown
             def select_text():
@@ -288,40 +510,10 @@ class StableMahalanobisDetection(IPlugin):
             timer.singleShot(100, select_text)
 
             # Show window
-            self.plot_window.show()
-
-        def perform_outlier_detection(threshold, distances):
-            """Perform outlier detection with given threshold"""
-            if distances is None or self._spike_ids is None:
-                logger.warn("No distances or spike IDs available")
-                return
-
-            try:
-                outliers = distances > threshold
-                n_outliers = np.sum(outliers)
-
-                # Log results
-                logger.info(f"Analysis with threshold {threshold}:")
-                logger.info(f"- Detected {n_outliers} outliers ({n_outliers / len(distances) * 100:.1f}%)")
-                logger.info(f"- Maximum distance: {np.max(distances):.1f}")
-                logger.info(f"- 99.9th percentile: {np.percentile(distances, 99.9):.1f}")
-                logger.info(f"- 99th percentile: {np.percentile(distances, 99):.1f}")
-                logger.info(f"- Median distance: {np.median(distances):.1f}")
-
-                # Sort and display top distances
-                sorted_dist = np.sort(distances)[-10:]
-                logger.info(f"Top 10 distances: {', '.join(f'{d:.1f}' for d in sorted_dist)}")
-
-                # Prepare for split
-                if n_outliers > 0:
-                    labels = np.ones(len(distances), dtype=int)
-                    labels[outliers] = 2
-                    controller.supervisor.actions.split(self._spike_ids, labels)
-                else:
-                    logger.info("No outliers detected at current threshold")
-
-            except Exception as e:
-                logger.error(f"Error in outlier detection: {str(e)}")
+            plugin.plot_window.show()
+        
+        # Override the plot_distribution method directly
+        self.plot_distribution = plot_distribution
 
         @connect
         def on_gui_ready(sender, gui):
@@ -338,55 +530,102 @@ class StableMahalanobisDetection(IPlugin):
                     # Get selected clusters and spikes
                     cluster_ids = controller.supervisor.selected
                     if not cluster_ids:
-                        logger.warn("No clusters selected!")
+                        QtWidgets.QMessageBox.warning(
+                            None, 'Warning', "No clusters selected!"
+                        )
                         return
 
                     bunchs = controller._amplitude_getter(cluster_ids, name='template', load_all=True)
                     self._spike_ids = bunchs[0].spike_ids
 
-                    # Prepare features
-                    features = prepare_features(self._spike_ids)
-                    if features is None:
-                        return
+                    # Show progress dialog
+                    self.show_progress_dialog("Computing Mahalanobis distances...")
+                    
+                    # Run analysis in a separate thread to avoid UI freezing
+                    def run_analysis():
+                        try:
+                            # Prepare features
+                            features = prepare_features(self._spike_ids)
+                            if features is None:
+                                # Signal to the main thread to show an error dialog
+                                self._pending_error_msg = "Failed to prepare features for analysis"
+                                self.add_main_thread_action(lambda: self.show_error_dialog(self._pending_error_msg))
+                                return
 
-                    # Minimum spikes check
-                    if features.shape[0] < features.shape[1] * 2:
-                        logger.warn(f"Warning: Need at least {features.shape[1] * 2} spikes!")
-                        return
+                            # Minimum spikes check
+                            if features.shape[0] < features.shape[1] * 2:
+                                warning_msg = f"Need at least {features.shape[1] * 2} spikes for statistical stability!"
+                                self.add_main_thread_action(lambda: self.show_error_dialog(warning_msg))
+                                return
 
-                    # Compute distances
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        distances = stable_mahalanobis(features)
+                            # Compute distances
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                distances = stable_mahalanobis(features)
 
-                    if distances is None:
-                        return
+                            if distances is None:
+                                self.add_main_thread_action(lambda: self.show_error_dialog("Failed to compute Mahalanobis distances"))
+                                return
 
-                    # Store current distances
-                    self.current_distances = distances
+                            # Store current distances
+                            self.current_distances = distances
 
-                    # Calculate initial threshold using chi-square distribution
-                    initial_threshold = calculate_robust_threshold(distances)
-                    if initial_threshold is None:
-                        return
+                            # Calculate initial threshold using chi-square distribution
+                            initial_threshold = calculate_robust_threshold(distances)
+                            if initial_threshold is None:
+                                return
 
-                    # Log distribution analysis
-                    logger.info("\nDistribution Analysis:")
-                    logger.info(f"Number of dimensions: {self._n_features}")
-                    logger.info(f"Expected mean distance (sqrt(p)): {np.sqrt(self._n_features):.2f}")
-                    logger.info(f"Observed mean distance: {np.mean(distances):.2f}")
-                    logger.info(f"Observed median distance: {np.median(distances):.2f}")
+                            # Log distribution analysis
+                            logger.info("\nDistribution Analysis:")
+                            logger.info(f"Number of dimensions: {self._n_features}")
+                            logger.info(f"Expected mean distance (sqrt(p)): {np.sqrt(self._n_features):.2f}")
+                            logger.info(f"Observed mean distance: {np.mean(distances):.2f}")
+                            logger.info(f"Observed median distance: {np.median(distances):.2f}")
 
-                    # Check for substantial deviation from theoretical expectation
-                    expected_mean = np.sqrt(self._n_features)
-                    observed_mean = np.mean(distances)
-                    if abs(observed_mean - expected_mean) / expected_mean > 0.5:
-                        logger.warn(f"Substantial deviation from theoretical expectation:")
-                        logger.warn(f"This might indicate non-normal features or other irregularities.")
-
-                    # Show distribution plot
-                    plot_distribution(distances, initial_threshold)
-
+                            # Check for substantial deviation from theoretical expectation
+                            expected_mean = np.sqrt(self._n_features)
+                            observed_mean = np.mean(distances)
+                            if abs(observed_mean - expected_mean) / expected_mean > 0.5:
+                                logger.warn(f"Substantial deviation from theoretical expectation:")
+                                logger.warn(f"This might indicate non-normal features or other irregularities.")
+                            
+                            # Close progress dialog and store parameters for plot distribution
+                            self.add_main_thread_action(self.close_progress_dialog)
+                            
+                            # Store parameters and call plot_distribution via invokeMethod
+                            self._pending_distances = distances
+                            self._pending_threshold = initial_threshold
+                            self.add_main_thread_action(self.plot_distribution_from_thread)
+                            
+                        except Exception as e:
+                            logger.error(f"Error in analysis thread: {str(e)}")
+                            logger.error("Stack trace:", exc_info=True)
+                            
+                            # Show error on main thread
+                            self.add_main_thread_action(self.close_progress_dialog)
+                            self.add_main_thread_action(lambda: self.show_error_dialog(f"Analysis error: {str(e)}"))
+                    
+                    # Start analysis thread
+                    Thread(target=run_analysis).start()
+                    
                 except Exception as e:
                     logger.error(f"Error in stable_mahalanobis_outliers: {str(e)}")
                     logger.error("Stack trace:", exc_info=True)
+                    
+                    # Close progress dialog if open
+                    if self.progress_dialog and self.progress_dialog.isVisible():
+                        self.progress_dialog.close()
+                    
+                    QtWidgets.QMessageBox.critical(
+                        None, 'Error', f"Failed to start analysis: {str(e)}"
+                    )
+
+            # Add a cleanup action
+            @connect
+            def on_close(sender):
+                if self._timer:
+                    self._timer.stop()
+                if self.plot_window:
+                    self.plot_window.close()
+                if self.progress_dialog:
+                    self.progress_dialog.close()
